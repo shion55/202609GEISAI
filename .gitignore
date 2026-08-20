@@ -1,0 +1,21 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Secrets / local config
+.env
+
+# Ableton
+**/Backup/
+*.asd
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Editor
+.vscode/
