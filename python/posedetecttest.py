@@ -74,6 +74,16 @@ CALIBRATION_PREPARE_SECONDS = 3.0
 
 # 最初に立ち位置まで移動する時間
 CALIBRATION_START_DELAY = 5.0
+
+# 各方向の取得が終わってから、次の方向に移るまでの間隔
+CALIBRATION_GAP_SECONDS = 1.0
+
+# 足が指定範囲を外れてから中止するまでの猶予。
+# 0.0 にすると即時停止。少しだけ認識落ちに耐えるため0.3秒。
+CALIBRATION_EXIT_GRACE_SECONDS = 0.3
+
+# キャリブレーション画面の表示倍率
+CALIBRATION_DISPLAY_SCALE = 3.0
 # ------------------------------------------------------------
 # Smoothing
 # ------------------------------------------------------------
@@ -677,15 +687,15 @@ def person_inside_standing_area(
 
 def azimuth_from_calibration(
     current_direction,
-    reference_vectors
+    reference_vectors,
+    previous_angle=None
 ):
 
     """
-    保存された16方向の2Dベクトルから
-    現在の物理的な0～360°を求める。
+    保存された2Dキャリブレーション点から現在の0～360°を求める。
 
-    隣り合うキャリブレーション点を結ぶ線分のうち、
-    現在ベクトルに最も近い場所を採用する。
+    画像上で似た方向が複数ある場合は、
+    前フレームの角度に近い候補を優先して突然の別スピーカー飛びを抑える。
     """
 
     current = normalize(
@@ -714,8 +724,7 @@ def azimuth_from_calibration(
     )
 
 
-    best_error = float("inf")
-    best_angle = None
+    candidates = []
 
 
     for i in range(n):
@@ -774,20 +783,65 @@ def azimuth_from_calibration(
         )
 
 
-        if error < best_error:
+        angle = (
+            i * step
+            + t * step
+        ) % 360.0
 
+
+        candidates.append(
+            (
+                angle,
+                error
+            )
+        )
+
+
+    if previous_angle is None:
+
+        best = min(
+            candidates,
+            key=lambda x: x[1]
+        )
+
+        return best
+
+
+    def angular_distance(a, b):
+
+        return abs(
+            (
+                a - b + 180.0
+            ) % 360.0
+            - 180.0
+        )
+
+
+    CONTINUITY_WEIGHT = 0.008
+
+    best_angle = None
+    best_error = None
+    best_cost = float("inf")
+
+
+    for angle, error in candidates:
+
+        angle_diff = angular_distance(
+            angle,
+            previous_angle
+        )
+
+        cost = (
+            error
+            + CONTINUITY_WEIGHT
+            * angle_diff
+        )
+
+        if cost < best_cost:
+
+            best_cost = cost
+            best_angle = angle
             best_error = error
-
-            physical_angle = (
-                i * step
-                + t * step
-            )
-
-
-            best_angle = (
-                physical_angle
-                % 360.0
-            )
 
 
     return (
@@ -877,6 +931,163 @@ def draw_standing_area(
         (0, 255, 255),
         2
     )
+
+
+def show_calibration(image):
+    """
+    認識用画像は変更せず、表示するときだけ拡大する。
+    """
+    enlarged = cv2.resize(
+        image,
+        None,
+        fx=CALIBRATION_DISPLAY_SCALE,
+        fy=CALIBRATION_DISPLAY_SCALE,
+        interpolation=cv2.INTER_LINEAR
+    )
+
+    cv2.imshow(
+        "Calibration",
+        enlarged
+    )
+
+
+class CalibrationAborted(Exception):
+    pass
+
+
+def feet_inside_standing_area(kpts2d, scores, standing_roi):
+    """キャリブレーション中は足首だけで立ち位置を監視する。"""
+    x, y, w, h = standing_roi
+
+    if (
+        scores[LEFT_ANKLE] < JOINT_THRESHOLD
+        or scores[RIGHT_ANKLE] < JOINT_THRESHOLD
+    ):
+        return False
+
+    left_ankle = np.asarray(kpts2d[LEFT_ANKLE], dtype=np.float32)
+    right_ankle = np.asarray(kpts2d[RIGHT_ANKLE], dtype=np.float32)
+    foot_center = (left_ankle + right_ankle) / 2.0
+
+    fx = float(foot_center[0])
+    fy = float(foot_center[1])
+
+    return (
+        x <= fx <= x + w
+        and y <= fy <= y + h
+    )
+
+
+def send_calibration_direction(osc, side, angle):
+    """Max側で route /calibration/right /calibration/left しやすい形式。"""
+    osc.send_message(
+        f"/calibration/{side}",
+        float(angle)
+    )
+
+
+def abort_calibration(osc, message="CALIBRATION STOPPED"):
+    osc.send_message("/calibration/recording", 0)
+    osc.send_message("/calibration/stop", 1)
+    print(message)
+    raise CalibrationAborted(message)
+
+
+def update_calibration_foot_guard(
+    pose,
+    standing_roi,
+    foot_out_since,
+    osc
+):
+    """
+    足がStanding Areaから一定時間外れたらキャリブレーション全体を中止。
+    一瞬のキーポイント落ちだけで止まらないよう短い猶予を持たせる。
+    """
+    now = time.monotonic()
+
+    if pose is None:
+        feet_inside = False
+    else:
+        feet_inside = feet_inside_standing_area(
+            pose["keypoints2d"],
+            pose["scores"],
+            standing_roi
+        )
+
+    if feet_inside:
+        return None, True
+
+    if foot_out_since is None:
+        foot_out_since = now
+
+    if (
+        now - foot_out_since
+        >= CALIBRATION_EXIT_GRACE_SECONDS
+    ):
+        abort_calibration(
+            osc,
+            "Foot left standing area -> calibration stopped"
+        )
+
+    return foot_out_since, False
+
+
+def calibration_gap(
+    cap,
+    pose_model,
+    person_roi,
+    standing_roi,
+    osc,
+    seconds=CALIBRATION_GAP_SECONDS
+):
+    """方向取得後の無音インターバル。足位置は監視し続ける。"""
+    px, py, pw, ph = person_roi
+    start = time.monotonic()
+    foot_out_since = None
+
+    while True:
+        elapsed = time.monotonic() - start
+        remaining = seconds - elapsed
+
+        if remaining <= 0:
+            return
+
+        success, frame = cap.read()
+        if not success:
+            continue
+
+        crop = frame[py:py + ph, px:px + pw]
+        pose = infer_pose(pose_model, crop)
+
+        foot_out_since, _ = update_calibration_foot_guard(
+            pose,
+            standing_roi,
+            foot_out_since,
+            osc
+        )
+
+        preview = crop.copy()
+        draw_standing_area(preview, standing_roi)
+
+        if pose is not None:
+            draw_body(
+                preview,
+                pose["keypoints2d"],
+                pose["scores"]
+            )
+
+        cv2.putText(
+            preview,
+            f"NEXT IN {remaining:.1f}",
+            (15, 50),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (0, 255, 255),
+            2
+        )
+
+        show_calibration(preview)
+        cv2.waitKey(1)
 
 
 # ============================================================
@@ -1130,6 +1341,7 @@ def capture_calibration_direction(
     pose_model,
     person_roi,
     standing_roi,
+    osc,
     side,
     angle
 ):
@@ -1137,15 +1349,17 @@ def capture_calibration_direction(
     px, py, pw, ph = person_roi
 
     # ========================================================
-    # 3秒間、その方向へ腕を動かす時間
+    # 3秒待機
+    # 1秒ごとに3回、Maxへ現在の方向を送る
     # ========================================================
 
     start_time = time.monotonic()
+    last_cue_index = -1
+    foot_out_since = None
 
     while True:
 
         success, frame = cap.read()
-
         if not success:
             continue
 
@@ -1160,7 +1374,6 @@ def capture_calibration_direction(
         )
 
         preview = crop.copy()
-
         draw_standing_area(
             preview,
             standing_roi
@@ -1169,7 +1382,6 @@ def capture_calibration_direction(
         ready = False
 
         if pose is not None:
-
             k2d = pose["keypoints2d"]
             scores = pose["scores"]
 
@@ -1186,30 +1398,49 @@ def capture_calibration_direction(
             )
 
             if (
-                person_inside_standing_area(
+                feet_inside_standing_area(
                     k2d,
                     scores,
                     standing_roi
                 )
-                and
-                arm is not None
-                and
-                arm["length_px"] >= MIN_ARM_2D_PIXELS
-                and
-                arm["extension"] >= CALIBRATION_MIN_EXTENSION
+                and arm is not None
+                and arm["length_px"] >= MIN_ARM_2D_PIXELS
+                and arm["extension"] >= CALIBRATION_MIN_EXTENSION
             ):
                 ready = True
 
-        elapsed = (
-            time.monotonic()
-            - start_time
+        # 足が範囲を出たらキャリブレーション全体を中止
+        foot_out_since, feet_inside = update_calibration_foot_guard(
+            pose,
+            standing_roi,
+            foot_out_since,
+            osc
         )
 
+        elapsed = time.monotonic() - start_time
         remaining = max(
             0.0,
-            CALIBRATION_PREPARE_SECONDS
-            - elapsed
+            CALIBRATION_PREPARE_SECONDS - elapsed
         )
+
+        # ----------------------------------------------------
+        # 3秒待機なら t=0,1,2秒付近で合計3回送る
+        # /calibration/right 90.0
+        # /calibration/left  45.0
+        # ----------------------------------------------------
+        cue_index = int(elapsed)
+
+        if (
+            feet_inside
+            and cue_index < int(CALIBRATION_PREPARE_SECONDS)
+            and cue_index != last_cue_index
+        ):
+            send_calibration_direction(
+                osc,
+                side,
+                angle
+            )
+            last_cue_index = cue_index
 
         # ====================================================
         # 表示
@@ -1241,127 +1472,125 @@ def capture_calibration_direction(
             (15, 100),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.65,
-            (
-                (0, 255, 0)
-                if ready
-                else
-                (0, 0, 255)
-            ),
+            (0, 255, 0) if ready else (0, 0, 255),
             2
         )
 
-        cv2.imshow(
-            "Calibration",
-            preview
-        )
-
+        show_calibration(preview)
         cv2.waitKey(1)
 
-        # 3秒経過
-        if elapsed >= CALIBRATION_PREPARE_SECONDS:
-
-            # ポーズがまだ条件を満たしていないなら
-            # 自動的に待つ
-            if ready:
-                break
-
+        # 3秒経過後、腕も条件を満たしていれば録音/取得へ
+        if (
+            elapsed >= CALIBRATION_PREPARE_SECONDS
+            and ready
+        ):
+            break
 
     # ========================================================
-    # 自動サンプリング
+    # 8フレーム取得開始
+    # 同じ方向をもう一度送信し、recording=1
+    # Max側ではここで持続音を開始できる
     # ========================================================
+
+    send_calibration_direction(
+        osc,
+        side,
+        angle
+    )
+    osc.send_message(
+        "/calibration/recording",
+        1
+    )
 
     samples = []
+    foot_out_since = None
 
-    while len(samples) < CALIBRATION_SAMPLES:
+    try:
+        while len(samples) < CALIBRATION_SAMPLES:
 
-        success, frame = cap.read()
+            success, frame = cap.read()
+            if not success:
+                continue
 
-        if not success:
-            continue
+            crop = frame[
+                py:py + ph,
+                px:px + pw
+            ]
 
-        crop = frame[
-            py:py + ph,
-            px:px + pw
-        ]
+            pose = infer_pose(
+                pose_model,
+                crop
+            )
 
-        pose = infer_pose(
-            pose_model,
-            crop
-        )
-
-        preview = crop.copy()
-
-        draw_standing_area(
-            preview,
-            standing_roi
-        )
-
-        if pose is not None:
-
-            k2d = pose["keypoints2d"]
-            scores = pose["scores"]
-
-            draw_body(
+            preview = crop.copy()
+            draw_standing_area(
                 preview,
-                k2d,
-                scores
+                standing_roi
             )
 
-            arm = get_arm_2d(
-                k2d,
-                scores,
-                side
+            foot_out_since, feet_inside = update_calibration_foot_guard(
+                pose,
+                standing_roi,
+                foot_out_since,
+                osc
             )
 
-            if (
-                person_inside_standing_area(
+            if pose is not None:
+
+                k2d = pose["keypoints2d"]
+                scores = pose["scores"]
+
+                draw_body(
+                    preview,
+                    k2d,
+                    scores
+                )
+
+                arm = get_arm_2d(
                     k2d,
                     scores,
-                    standing_roi
-                )
-                and
-                arm is not None
-                and
-                arm["length_px"] >= MIN_ARM_2D_PIXELS
-                and
-                arm["extension"] >= CALIBRATION_MIN_EXTENSION
-            ):
-
-                samples.append(
-                    arm["direction"]
+                    side
                 )
 
-        cv2.putText(
-            preview,
-            f"{side.upper()}  {angle:.1f} deg",
-            (15, 30),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (255, 255, 255),
-            2
+                if (
+                    feet_inside
+                    and arm is not None
+                    and arm["length_px"] >= MIN_ARM_2D_PIXELS
+                    and arm["extension"] >= CALIBRATION_MIN_EXTENSION
+                ):
+                    samples.append(
+                        arm["direction"]
+                    )
+
+            cv2.putText(
+                preview,
+                f"{side.upper()}  {angle:.1f} deg",
+                (15, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (255, 255, 255),
+                2
+            )
+
+            cv2.putText(
+                preview,
+                f"RECORDING {len(samples)}/{CALIBRATION_SAMPLES}",
+                (15, 65),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (0, 255, 0),
+                2
+            )
+
+            show_calibration(preview)
+            cv2.waitKey(1)
+
+    finally:
+        # 取得完了でも中止でも音を止められる
+        osc.send_message(
+            "/calibration/recording",
+            0
         )
-
-        cv2.putText(
-            preview,
-            f"RECORDING {len(samples)}/{CALIBRATION_SAMPLES}",
-            (15, 65),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            (0, 255, 0),
-            2
-        )
-
-        cv2.imshow(
-            "Calibration",
-            preview
-        )
-
-        cv2.waitKey(1)
-
-
-    # ========================================================
-    # 平均ベクトル
-    # ========================================================
 
     mean_vector = normalize(
         np.mean(
@@ -1385,75 +1614,56 @@ def calibrate_directions(
     cap,
     pose_model,
     person_roi,
-    standing_roi
+    standing_roi,
+    osc
 ):
 
-    step = (
-        360.0
-        / CALIBRATION_DIRECTIONS
-    )
-
+    step = 360.0 / CALIBRATION_DIRECTIONS
     angles = [
         i * step
-        for i in range(
-            CALIBRATION_DIRECTIONS
-        )
+        for i in range(CALIBRATION_DIRECTIONS)
     ]
 
     right_vectors = []
     left_vectors = []
 
     print()
-    print(
-        "===== DIRECTION CALIBRATION ====="
-    )
-    print(
-        "0 deg = SPATで0°にしたい実空間方向"
-    )
-    print(
-        "表示された角度の方向へ腕を伸ばしてください"
-    )
+    print("===== DIRECTION CALIBRATION =====")
+    print("0 deg = SPATで0°にしたい実空間方向")
+    print("表示された角度の方向へ腕を伸ばしてください")
     print()
+
+    osc.send_message(
+        "/calibration/start",
+        1
+    )
 
     # ========================================================
     # 最初に立ち位置まで移動する時間
+    # ここではまだ足が範囲外でも中止しない
     # ========================================================
 
     print(
-        f"Calibration starts in "
-        f"{CALIBRATION_START_DELAY} seconds."
+        f"Calibration starts in {CALIBRATION_START_DELAY} seconds."
     )
 
     start_wait = time.monotonic()
 
     while True:
 
-        elapsed = (
-            time.monotonic()
-            - start_wait
-        )
-
-        remaining = (
-            CALIBRATION_START_DELAY
-            - elapsed
-        )
+        elapsed = time.monotonic() - start_wait
+        remaining = CALIBRATION_START_DELAY - elapsed
 
         if remaining <= 0:
             break
 
         success, frame = cap.read()
-
         if not success:
             continue
 
         px, py, pw, ph = person_roi
+        crop = frame[py:py + ph, px:px + pw].copy()
 
-        crop = frame[
-            py:py + ph,
-            px:px + pw
-        ].copy()
-
-        # 立ち位置表示
         draw_standing_area(
             crop,
             standing_roi
@@ -1461,10 +1671,7 @@ def calibrate_directions(
 
         cv2.putText(
             crop,
-            (
-                f"Calibration starts in "
-                f"{remaining:.1f}"
-            ),
+            f"Calibration starts in {remaining:.1f}",
             (20, 40),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.7,
@@ -1482,11 +1689,7 @@ def calibrate_directions(
             1
         )
 
-        cv2.imshow(
-            "Calibration",
-            crop
-        )
-
+        show_calibration(crop)
         cv2.waitKey(1)
 
     # ========================================================
@@ -1496,94 +1699,30 @@ def calibrate_directions(
     print()
     print("----- RIGHT HAND -----")
 
-    for angle in angles:
+    for i, angle in enumerate(angles):
 
-        print(
-            f"RIGHT -> {angle:.1f} deg"
-        )
+        print(f"RIGHT -> {angle:.1f} deg")
 
         vector = capture_calibration_direction(
             cap,
             pose_model,
             person_roi,
             standing_roi,
+            osc,
             "right",
             angle
         )
 
-        right_vectors.append(
-            vector
+        right_vectors.append(vector)
+
+        # 次方向へ行く前に1秒空ける
+        calibration_gap(
+            cap,
+            pose_model,
+            person_roi,
+            standing_roi,
+            osc
         )
-
-    # ========================================================
-    # 左右切り替えのため少し待つ
-    # ========================================================
-
-    switch_seconds = 3.0
-
-    switch_start = time.monotonic()
-
-    while True:
-
-        elapsed = (
-            time.monotonic()
-            - switch_start
-        )
-
-        remaining = (
-            switch_seconds
-            - elapsed
-        )
-
-        if remaining <= 0:
-            break
-
-        success, frame = cap.read()
-
-        if not success:
-            continue
-
-        px, py, pw, ph = person_roi
-
-        crop = frame[
-            py:py + ph,
-            px:px + pw
-        ].copy()
-
-        draw_standing_area(
-            crop,
-            standing_roi
-        )
-
-        cv2.putText(
-            crop,
-            "RIGHT COMPLETE",
-            (20, 40),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (0, 255, 0),
-            2
-        )
-
-        cv2.putText(
-            crop,
-            (
-                f"LEFT starts in "
-                f"{remaining:.1f}"
-            ),
-            (20, 75),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.65,
-            (0, 255, 255),
-            2
-        )
-
-        cv2.imshow(
-            "Calibration",
-            crop
-        )
-
-        cv2.waitKey(1)
 
     # ========================================================
     # LEFT HAND
@@ -1592,48 +1731,51 @@ def calibrate_directions(
     print()
     print("----- LEFT HAND -----")
 
-    for angle in angles:
+    for i, angle in enumerate(angles):
 
-        print(
-            f"LEFT -> {angle:.1f} deg"
-        )
+        print(f"LEFT -> {angle:.1f} deg")
 
         vector = capture_calibration_direction(
             cap,
             pose_model,
             person_roi,
             standing_roi,
+            osc,
             "left",
             angle
         )
 
-        left_vectors.append(
-            vector
-        )
+        left_vectors.append(vector)
+
+        # 最後の方向の後は不要だが、途中は1秒空ける
+        if i < len(angles) - 1:
+            calibration_gap(
+                cap,
+                pose_model,
+                person_roi,
+                standing_roi,
+                osc
+            )
 
     # ========================================================
-    # 完了表示
+    # 完了
     # ========================================================
+
+    osc.send_message(
+        "/calibration/complete",
+        1
+    )
 
     complete_start = time.monotonic()
 
-    while (
-        time.monotonic()
-        - complete_start
-        < 2.0
-    ):
+    while time.monotonic() - complete_start < 2.0:
 
         success, frame = cap.read()
-
         if not success:
             continue
 
         px, py, pw, ph = person_roi
-
-        crop = frame[
-            py:py + ph,
-            px:px + pw
-        ].copy()
+        crop = frame[py:py + ph, px:px + pw].copy()
 
         cv2.putText(
             crop,
@@ -1645,27 +1787,16 @@ def calibrate_directions(
             2
         )
 
-        cv2.imshow(
-            "Calibration",
-            crop
-        )
-
+        show_calibration(crop)
         cv2.waitKey(1)
 
-    cv2.destroyWindow(
-        "Calibration"
-    )
+    cv2.destroyWindow("Calibration")
 
     print()
-    print(
-        "===== CALIBRATION COMPLETE ====="
-    )
+    print("===== CALIBRATION COMPLETE =====")
     print()
 
-    return (
-        right_vectors,
-        left_vectors
-    )
+    return right_vectors, left_vectors
 
 # ============================================================
 # FULL CALIBRATION
@@ -1673,7 +1804,8 @@ def calibrate_directions(
 
 def run_full_calibration(
     cap,
-    pose_model
+    pose_model,
+    osc
 ):
 
     person_roi, standing_roi = select_rois(
@@ -1685,7 +1817,8 @@ def run_full_calibration(
         cap,
         pose_model,
         person_roi,
-        standing_roi
+        standing_roi,
+        osc
     )
 
 
@@ -1851,10 +1984,17 @@ def main():
 
     if calibration is None:
 
-        calibration = run_full_calibration(
-            cap,
-            pose_model
-        )
+        try:
+            calibration = run_full_calibration(
+                cap,
+                pose_model,
+                osc
+            )
+        except CalibrationAborted:
+            cv2.destroyAllWindows()
+            cap.release()
+            print("Calibration aborted. Run the script again to restart calibration.")
+            return
 
     else:
 
@@ -2274,7 +2414,11 @@ def main():
                                         "direction"
                                     ],
 
-                                    refs
+                                    refs,
+
+                                    smoothed_azimuth[
+                                        side
+                                    ]
                                 )
 
 
@@ -2674,10 +2818,18 @@ def main():
                 )
 
 
-                calibration = run_full_calibration(
-                    cap,
-                    pose_model
-                )
+                try:
+                    new_calibration = run_full_calibration(
+                        cap,
+                        pose_model,
+                        osc
+                    )
+                except CalibrationAborted:
+                    cv2.destroyWindow("Calibration")
+                    print("Recalibration aborted. Keeping previous calibration.")
+                    continue
+
+                calibration = new_calibration
 
 
                 person_roi = calibration[
