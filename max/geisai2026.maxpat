@@ -9,9 +9,44 @@
             "modernui": 1
         },
         "classnamespace": "box",
-        "rect": [ 34.0, 76.0, 983.0, 562.0 ],
+        "rect": [ 34.0, 76.0, 1212.0, 562.0 ],
         "style": "jpatcher001",
         "boxes": [
+            {
+                "box": {
+                    "id": "obj-14",
+                    "lastchannelcount": 0,
+                    "maxclass": "live.gain~",
+                    "numinlets": 2,
+                    "numoutlets": 5,
+                    "outlettype": [ "signal", "signal", "", "float", "list" ],
+                    "parameter_enable": 1,
+                    "patching_rect": [ 507.0, 439.0, 110.0, 87.0 ],
+                    "saved_attribute_attributes": {
+                        "valueof": {
+                            "parameter_longname": "live.gain~[1]",
+                            "parameter_mmax": 6.0,
+                            "parameter_mmin": -70.0,
+                            "parameter_modmode": 3,
+                            "parameter_shortname": "live.gain~[1]",
+                            "parameter_type": 0,
+                            "parameter_unitstyle": 4
+                        }
+                    },
+                    "varname": "live.gain~[1]"
+                }
+            },
+            {
+                "box": {
+                    "id": "obj-13",
+                    "maxclass": "newobj",
+                    "numinlets": 1,
+                    "numoutlets": 2,
+                    "outlettype": [ "signal", "signal" ],
+                    "patching_rect": [ 585.0, 346.0, 32.0, 20.0 ],
+                    "text": "adc~"
+                }
+            },
             {
                 "box": {
                     "fontname": "Arial",
@@ -42,7 +77,7 @@
                             "modernui": 1
                         },
                         "classnamespace": "box",
-                        "rect": [ 34.0, 76.0, 1212.0, 562.0 ],
+                        "rect": [ 134.0, 134.0, 1212.0, 562.0 ],
                         "visible": 1,
                         "boxes": [
                             {
@@ -570,8 +605,8 @@
                                     "numinlets": 2,
                                     "numoutlets": 1,
                                     "outlettype": [ "bang" ],
-                                    "patching_rect": [ 526.9629458189011, 424.0964012145996, 49.0, 22.0 ],
-                                    "text": "metro 6"
+                                    "patching_rect": [ 526.9629458189011, 424.0964012145996, 56.0, 22.0 ],
+                                    "text": "metro 20"
                                 }
                             },
                             {
@@ -648,7 +683,7 @@
                                     "numinlets": 1,
                                     "numoutlets": 1,
                                     "outlettype": [ "" ],
-                                    "patching_rect": [ 1094.074038207531, 245.92591786384583, 188.88888269662857, 50.0 ],
+                                    "patching_rect": [ 1094.074038207531, 245.92591786384583, 189.0, 50.0 ],
                                     "text": "loadmess read Patcher:/audio/syokusenki/syokusenki_4_4.wav"
                                 }
                             },
@@ -1945,7 +1980,6 @@
                         },
                         "classnamespace": "box",
                         "rect": [ -16.0, 124.0, 1212.0, 562.0 ],
-                        "visible": 1,
                         "boxes": [
                             {
                                 "box": {
@@ -2656,7 +2690,7 @@
                                             "modernui": 1
                                         },
                                         "classnamespace": "box",
-                                        "rect": [ -10627.0, -10585.0, 980.0, 562.0 ],
+                                        "rect": [ 134.0, 134.0, 980.0, 562.0 ],
                                         "visible": 1,
                                         "boxes": [
                                             {
@@ -4959,6 +4993,24 @@
             },
             {
                 "patchline": {
+                    "destination": [ "obj-14", 1 ],
+                    "source": [ "obj-13", 1 ]
+                }
+            },
+            {
+                "patchline": {
+                    "destination": [ "obj-14", 0 ],
+                    "source": [ "obj-13", 0 ]
+                }
+            },
+            {
+                "patchline": {
+                    "destination": [ "obj-7", 9 ],
+                    "source": [ "obj-14", 1 ]
+                }
+            },
+            {
+                "patchline": {
                     "destination": [ "obj-27", 7 ],
                     "source": [ "obj-18", 7 ]
                 }
@@ -5239,6 +5291,7 @@
             }
         ],
         "parameters": {
+            "obj-14": [ "live.gain~[1]", "live.gain~[1]", 0 ],
             "obj-18": [ "live.gain~", "live.gain~", 0 ],
             "obj-40::obj-40": [ "Glide", "Glide", 0 ],
             "obj-40::obj-71": [ "Transp", "Transp", 0 ],
